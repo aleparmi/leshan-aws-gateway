@@ -1,7 +1,16 @@
+<<<<<<< HEAD
 ![Leshan](https://eclipse.org/leshan/img/multicolor-leshan.png)
+=======
+Fork of [Eclipse Leshan](https://github.com/eclipse/leshan/) to build an LwM2M Gateway to AWS IoT.
 
-[Eclipse Leshan™](https://eclipse.org/leshan) is an OMA Lightweight M2M server and client Java implementation.
+      mvn clean install
+      # or mvn package
+      java -jar leshan-server-demo/target/leshan-server-demo-*-SNAPSHOT-jar-with-dependencies.jar
+>>>>>>> upstream/aws-bridge
 
+Goals:
+
+<<<<<<< HEAD
 [What is OMA LWM2M ?](https://omaspecworks.org/what-is-oma-specworks/iot/lightweight-m2m-lwm2m/)  
 [Object and Resource Registry](http://www.openmobilealliance.org/wp/OMNA/LwM2M/LwM2MRegistry.html).  
 
@@ -101,3 +110,7 @@ java -jar leshan-bsserver-demo/target/leshan-bsserver-demo-*-SNAPSHOT-jar-with-d
 Let's start to code !
 ---------------------
 Now you played a bit with our demo, you should start to code your own server or client using our [Getting-started](https://github.com/eclipse/leshan/wiki/Getting-started) guide.
+=======
+- persist device properties received via LwM2M in AWS IoT reported shadow
+- publish changes to AWS IoT desired shadow to device using LwM2M
+>>>>>>> upstream/aws-bridge

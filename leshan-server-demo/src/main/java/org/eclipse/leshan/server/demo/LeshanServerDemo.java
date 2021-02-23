@@ -1,15 +1,15 @@
 /*******************************************************************************
  * Copyright (c) 2013-2015 Sierra Wireless and others.
- * 
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v2.0
  * and Eclipse Distribution License v1.0 which accompany this distribution.
- * 
+ *
  * The Eclipse Public License is available at
  *    http://www.eclipse.org/legal/epl-v20.html
  * and the Eclipse Distribution License is available at
  *    http://www.eclipse.org/org/documents/edl-v10.html.
- * 
+ *
  * Contributors:
  *     Sierra Wireless - initial API and implementation
  *     Bosch Software Innovations - added Redis URL support with authentication
@@ -17,32 +17,22 @@
  *******************************************************************************/
 package org.eclipse.leshan.server.demo;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.net.BindException;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.URI;
-import java.security.*;
-import java.security.cert.Certificate;
-import java.security.cert.X509Certificate;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Enumeration;
-import java.util.List;
-
-import javax.jmdns.JmDNS;
-import javax.jmdns.ServiceInfo;
-
-import org.apache.commons.cli.CommandLine;
-import org.apache.commons.cli.DefaultParser;
-import org.apache.commons.cli.HelpFormatter;
-import org.apache.commons.cli.Options;
-import org.apache.commons.cli.ParseException;
+import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.AWSStaticCredentialsProvider;
+import com.amazonaws.services.iot.client.*;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
+import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
+import com.amazonaws.services.securitytoken.model.Credentials;
+import com.amazonaws.services.securitytoken.model.GetSessionTokenRequest;
+import com.amazonaws.services.securitytoken.model.GetSessionTokenResult;
+import com.amazonaws.services.sqs.AmazonSQS;
+import com.amazonaws.services.sqs.AmazonSQSClientBuilder;
+import com.amazonaws.services.sqs.model.MessageAttributeValue;
+import com.amazonaws.services.sqs.model.SendMessageRequest;
+import org.apache.commons.cli.*;
 import org.eclipse.californium.core.network.config.NetworkConfig;
 import org.eclipse.californium.core.network.config.NetworkConfig.Keys;
-import org.eclipse.californium.elements.util.SslContextUtil;
 import org.eclipse.californium.scandium.config.DtlsConnectorConfig;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.servlet.ServletHolder;
@@ -50,9 +40,19 @@ import org.eclipse.jetty.webapp.WebAppContext;
 import org.eclipse.leshan.core.LwM2m;
 import org.eclipse.leshan.core.model.ObjectLoader;
 import org.eclipse.leshan.core.model.ObjectModel;
+import org.eclipse.leshan.core.node.LwM2mPath;
+import org.eclipse.leshan.core.node.LwM2mResource;
+import org.eclipse.leshan.core.node.LwM2mSingleResource;
 import org.eclipse.leshan.core.node.codec.DefaultLwM2mNodeDecoder;
 import org.eclipse.leshan.core.node.codec.DefaultLwM2mNodeEncoder;
 import org.eclipse.leshan.core.node.codec.LwM2mNodeDecoder;
+import org.eclipse.leshan.core.observation.Observation;
+import org.eclipse.leshan.core.request.ObserveRequest;
+import org.eclipse.leshan.core.request.WriteRequest;
+import org.eclipse.leshan.core.response.ErrorCallback;
+import org.eclipse.leshan.core.response.ObserveResponse;
+import org.eclipse.leshan.core.response.ResponseCallback;
+import org.eclipse.leshan.core.response.WriteResponse;
 import org.eclipse.leshan.core.util.SecurityUtil;
 import org.eclipse.leshan.server.californium.LeshanServer;
 import org.eclipse.leshan.server.californium.LeshanServerBuilder;
@@ -63,18 +63,104 @@ import org.eclipse.leshan.server.demo.servlet.SecurityServlet;
 import org.eclipse.leshan.server.demo.utils.MagicLwM2mValueConverter;
 import org.eclipse.leshan.server.model.LwM2mModelProvider;
 import org.eclipse.leshan.server.model.VersionedModelProvider;
-import org.eclipse.leshan.server.redis.RedisRegistrationStore;
-import org.eclipse.leshan.server.redis.RedisSecurityStore;
+import org.eclipse.leshan.server.observation.ObservationListener;
+import org.eclipse.leshan.server.registration.Registration;
+import org.eclipse.leshan.server.registration.RegistrationListener;
+import org.eclipse.leshan.server.registration.RegistrationUpdate;
 import org.eclipse.leshan.server.security.EditableSecurityStore;
 import org.eclipse.leshan.server.security.FileSecurityStore;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.util.Pool;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.net.BindException;
+import java.net.InetSocketAddress;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class LeshanServerDemo {
+
+    final static long TIMEOUT_IN_MS = 60 * 1000;
+
+    private static final Logger LOG = LoggerFactory.getLogger(LeshanServerDemo.class);
+    // /!\ This field is a COPY of org.eclipse.leshan.client.demo.LeshanClientDemo.modelPaths /!\
+    // TODO create a leshan-demo project ?
+    private final static String[] modelPaths = new String[]{"10241.xml", "10242.xml", "10243.xml", "10244.xml",
+            "10245.xml", "10246.xml", "10247.xml", "10248.xml", "10249.xml", "10250.xml", "10251.xml",
+            "10252.xml", "10253.xml", "10254.xml", "10255.xml", "10256.xml", "10257.xml", "10258.xml",
+            "10259.xml", "10260-2_0.xml", "10260.xml", "10262.xml", "10263.xml", "10264.xml",
+            "10265.xml", "10266.xml", "10267.xml", "10268.xml", "10269.xml", "10270.xml", "10271.xml",
+            "10272.xml", "10273.xml", "10274.xml", "10275.xml", "10276.xml", "10277.xml", "10278.xml",
+            "10279.xml", "10280.xml", "10281.xml", "10282.xml", "10283.xml", "10284.xml", "10286.xml",
+            "10290.xml", "10291.xml", "10292.xml", "10299.xml", "10300.xml", "10308-2_0.xml",
+            "10308.xml", "10309.xml", "10311.xml", "10313.xml", "10314.xml", "10315.xml", "10316.xml",
+            "10318.xml", "10319.xml", "10320.xml", "10322.xml", "10323.xml", "10324.xml", "10326.xml",
+            "10327.xml", "10328.xml", "10329.xml", "10330.xml", "10331.xml", "10332.xml", "10333.xml",
+            "10334.xml", "10335.xml", "10336.xml", "10337.xml", "10338.xml", "10339.xml", "10340.xml",
+            "10341.xml", "10342.xml", "10343.xml", "10344.xml", "10345.xml", "10346.xml", "10347.xml",
+            "10348.xml", "10349.xml", "10350.xml", "10351.xml", "10352.xml", "10353.xml", "10354.xml",
+            "10355.xml", "10356.xml", "10357.xml", "10358.xml", "10359.xml", "10360.xml", "10361.xml",
+            "10362.xml", "10363.xml", "10364.xml", "10365.xml", "10366.xml", "10368.xml", "10369.xml",
+
+            "2048.xml", "2049.xml", "2050.xml", "2051.xml", "2052.xml", "2053.xml", "2054.xml",
+            "2055.xml", "2056.xml", "2057.xml",
+
+            "3200.xml", "3201.xml", "3202.xml", "3203.xml", "3300.xml", "3301.xml", "3302.xml",
+            "3303.xml", "3304.xml", "3305.xml", "3306.xml", "3308.xml", "3310.xml", "3311.xml",
+            "3312.xml", "3313.xml", "3314.xml", "3315.xml", "3316.xml", "3317.xml", "3318.xml",
+            "3319.xml", "3320.xml", "3321.xml", "3322.xml", "3323.xml", "3324.xml", "3325.xml",
+            "3326.xml", "3327.xml", "3328.xml", "3329.xml", "3330.xml", "3331.xml", "3332.xml",
+            "3333.xml", "3334.xml", "3335.xml", "3336.xml", "3337.xml", "3338.xml", "3339.xml",
+            "3340.xml", "3341.xml", "3342.xml", "3343.xml", "3344.xml", "3345.xml", "3346.xml",
+            "3347.xml", "3348.xml", "3349.xml", "3350.xml", "3351.xml", "3352.xml", "3353.xml",
+            "3354.xml", "3355.xml", "3356.xml", "3357.xml", "3358.xml", "3359.xml", "3360.xml",
+            "3361.xml", "3362.xml", "3363.xml", "3364.xml", "3365.xml", "3366.xml", "3367.xml",
+            "3368.xml", "3369.xml", "3370.xml", "3371.xml", "3372.xml", "3373.xml", "3374.xml",
+            "3375.xml", "3376.xml", "3377.xml", "3378.xml", "3379.xml", "3380-2_0.xml", "3380.xml",
+            "3381.xml", "3382.xml", "3383.xml", "3384.xml", "3385.xml", "3386.xml",
+
+            "LWM2M_APN_Connection_Profile-v1_0_1.xml", "LWM2M_Bearer_Selection-v1_0_1.xml",
+            "LWM2M_Cellular_Connectivity-v1_0_1.xml", "LWM2M_DevCapMgmt-v1_0.xml",
+            "LWM2M_LOCKWIPE-v1_0_1.xml", "LWM2M_Portfolio-v1_0.xml",
+            "LWM2M_Software_Component-v1_0.xml", "LWM2M_Software_Management-v1_0.xml",
+            "LWM2M_WLAN_connectivity4-v1_0.xml", "LwM2M_BinaryAppDataContainer-v1_0_1.xml",
+            "LwM2M_EventLog-V1_0.xml"};
+    private final static String USAGE = "java -jar leshan-server-demo.jar [OPTION]\n\n";
+
+    private final static AWSCredentialsProvider awsCredentials = new AWSStaticCredentialsProvider(
+            new AWSCredentials() {
+                @Override
+                public String getAWSAccessKeyId() {
+                    return System.getenv("AWS_ACCESS_KEY_ID");
+                }
+
+                @Override
+                public String getAWSSecretKey() {
+                    return System.getenv("AWS_SECRET_ACCESS_KEY");
+                }
+            }
+    );
+
+    private final static AmazonSQS sqs = AmazonSQSClientBuilder.standard()
+            .withRegion(System.getenv("AWS_REGION"))
+            .withCredentials(
+                    awsCredentials
+            ).build();
+
+    private final static AWSSecurityTokenService sts = AWSSecurityTokenServiceClientBuilder.standard()
+            .withRegion(System.getenv("AWS_REGION"))
+            .withCredentials(
+                    awsCredentials
+            )
+            .build();
 
     static {
         // Define a default logback.configurationFile
@@ -84,15 +170,7 @@ public class LeshanServerDemo {
         }
     }
 
-    private static final Logger LOG = LoggerFactory.getLogger(LeshanServerDemo.class);
-
-    private final static String USAGE = "java -jar leshan-server-demo.jar [OPTION]\n\n";
-
-    private final static String DEFAULT_KEYSTORE_TYPE = KeyStore.getDefaultType();
-
-    private final static String DEFAULT_KEYSTORE_ALIAS = "leshan";
-
-    public static void main(String[] args) {
+    public static void main(String[] args) throws FileNotFoundException {
         // Define options for command line tools
         Options options = new Options();
 
@@ -122,20 +200,6 @@ public class LeshanServerDemo {
         X509Chapter.append("\n| See https://github.com/eclipse/leshan/wiki/Credential-files-format   |");
         X509Chapter.append("\n------------------------------------------------------------------------");
 
-        final StringBuilder X509ChapterDeprecated = new StringBuilder();
-        X509ChapterDeprecated.append("\n .");
-        X509ChapterDeprecated.append("\n .");
-        X509ChapterDeprecated.append("\n=======================[ X509 deprecated way]===========================");
-        X509ChapterDeprecated.append("\n| By default Leshan demo uses an embedded self-signed certificate and  |");
-        X509ChapterDeprecated.append("\n| trusts any client certificates allowing to use RPK or X509           |");
-        X509ChapterDeprecated.append("\n| at client side.                                                      |");
-        X509ChapterDeprecated.append("\n| If you want to use your own server keys, certificates and truststore,|");
-        X509ChapterDeprecated.append("\n| you can provide a keystore using :                                   |");
-        X509ChapterDeprecated.append("\n|         -ks, -ksp, [-kst], [-ksa], -ksap should be used together     |");
-        X509ChapterDeprecated.append("\n| To get helps about files format and how to generate it, see :        |");
-        X509ChapterDeprecated.append("\n| See https://github.com/eclipse/leshan/wiki/Credential-files-format   |");
-        X509ChapterDeprecated.append("\n------------------------------------------------------------------------");
-
         options.addOption("h", "help", false, "Display help information.");
         options.addOption("lh", "coaphost", true, "Set the local CoAP address.\n  Default: any local address.");
         options.addOption("lp", "coapport", true,
@@ -147,10 +211,6 @@ public class LeshanServerDemo {
         options.addOption("wp", "webport", true, "Set the HTTP port for web server.\nDefault: 8080.");
         options.addOption("m", "modelsfolder", true, "A folder which contains object models in OMA DDF(.xml) format.");
         options.addOption("oc", "activate support of old/deprecated cipher suites.");
-        options.addOption("r", "redis", true,
-                "Use redis to store registration and securityInfo. \nThe URL of the redis server should be given using this format : 'redis://:password@hostname:port/db_number'\nExample without DB and password: 'redis://localhost:6379'\nDefault: redis is not used.");
-        options.addOption("mdns", "publishDNSSdServices", false,
-                "Publish leshan's services to DNS Service discovery" + RPKChapter);
         options.addOption("pubk", true,
                 "The path to your server public key file.\n The public Key should be in SubjectPublicKeyInfo format (DER encoding).");
         options.addOption("prik", true,
@@ -160,31 +220,6 @@ public class LeshanServerDemo {
                 "The path to your server certificate file.\n"
                         + "The certificate Common Name (CN) should generally be equal to the server hostname.\n"
                         + "The certificate should be in X509v3 format (DER encoding).");
-
-        final StringBuilder trustStoreChapter = new StringBuilder();
-        trustStoreChapter.append("\n .");
-        trustStoreChapter.append("\n URI format: file://<path-to-trust-store-file>#<hex-strore-password>#<alias-pattern>");
-        trustStoreChapter.append("\n .");
-        trustStoreChapter.append("\n Where:");
-        trustStoreChapter.append("\n - path-to-trust-store-file is path to pkcs12 trust store file");
-        trustStoreChapter.append("\n - hex-store-password is HEX formatted password for store");
-        trustStoreChapter.append("\n - alias-pattern can be used to filter trusted certificates and can also be empty to get all");
-        trustStoreChapter.append("\n .");
-        trustStoreChapter.append("\n Default: All certificates are trusted which is only OK for a demo.");
-
-        options.addOption("truststore", true,
-                "The path to a root certificate file to trust or a folder containing all the trusted certificates in X509v3 format (DER encoding) or trust store URI."
-                        + trustStoreChapter
-                        + X509ChapterDeprecated);
-        options.addOption("ks", "keystore", true,
-                "Set the key store file.\nIf set, X.509 mode is enabled, otherwise built-in RPK credentials are used.");
-        options.addOption("ksp", "storepass", true, "Set the key store password.");
-        options.addOption("kst", "storetype", true,
-                String.format("Set the key store type.\nDefault: %s.", DEFAULT_KEYSTORE_TYPE));
-        options.addOption("ksa", "alias", true, String.format(
-                "Set the key store alias to use for server credentials.\nDefault: %s.\n All other alias referencing a certificate will be trusted.",
-                DEFAULT_KEYSTORE_ALIAS));
-        options.addOption("ksap", "keypass", true, "Set the key store alias password to use.");
 
         HelpFormatter formatter = new HelpFormatter();
         formatter.setWidth(120);
@@ -273,9 +308,6 @@ public class LeshanServerDemo {
         // Get models folder
         String modelsFolderPath = cl.getOptionValue("m");
 
-        // get the Redis hostname:port
-        String redisUrl = cl.getOptionValue("r");
-
         // get RPK info
         PublicKey publicKey = null;
         PrivateKey privateKey = null;
@@ -305,67 +337,35 @@ public class LeshanServerDemo {
             }
         }
 
-        // configure trust store if given
+        // get X509 info
         List<Certificate> trustStore = null;
         if (cl.hasOption("truststore")) {
             trustStore = new ArrayList<>();
+            File input = new File(cl.getOptionValue("truststore"));
 
-            String trustStoreName = cl.getOptionValue("truststore");
+            // check input exists
+            if (!input.exists())
+                throw new FileNotFoundException(input.toString());
 
-            if (trustStoreName.startsWith("file://")) {
-                // Treat argument as Java trust store
-                try {
-                    Certificate[] trustedCertificates = SslContextUtil.loadTrustedCertificates(trustStoreName);
-                    trustStore.addAll(Arrays.asList(trustedCertificates));
-                } catch (Exception e) {
-                    System.err.println("Failed to load trust store : " + e.getMessage());
-                    e.printStackTrace();
-                    formatter.printHelp(USAGE, options);
-                    return;
-                }
+            // get input files.
+            File[] files;
+            if (input.isDirectory()) {
+                files = input.listFiles();
             } else {
-                // Treat argument as file or directory
-                File input = new File(cl.getOptionValue("truststore"));
-
-                // check input exists
-                if (!input.exists()) {
-                    System.err.println("Failed to load trust store - file or directory does not exist : " + input.toString());
-                    formatter.printHelp(USAGE, options);
-                    return;
-                }
-
-                // get input files.
-                File[] files;
-                if (input.isDirectory()) {
-                    files = input.listFiles();
-                } else {
-                    files = new File[] { input };
-                }
-                for (File file : files) {
-                    try {
-                        trustStore.add(SecurityUtil.certificate.readFromFile(file.getAbsolutePath()));
-                    } catch (Exception e) {
-                        LOG.warn("Unable to load X509 files {} : {} ", file.getAbsolutePath(), e.getMessage());
-                    }
+                files = new File[]{input};
+            }
+            for (File file : files) {
+                try {
+                    trustStore.add(SecurityUtil.certificate.readFromFile(file.getAbsolutePath()));
+                } catch (Exception e) {
+                    LOG.warn("Unable to load X509 files {}:{} ", file.getAbsolutePath(), e.getMessage());
                 }
             }
         }
 
-        // Get keystore parameters
-        String keyStorePath = cl.getOptionValue("ks");
-        String keyStoreType = cl.getOptionValue("kst", KeyStore.getDefaultType());
-        String keyStorePass = cl.getOptionValue("ksp");
-        String keyStoreAlias = cl.getOptionValue("ksa");
-        String keyStoreAliasPass = cl.getOptionValue("ksap");
-
-        // Get mDNS publish switch
-        Boolean publishDNSSdServices = cl.hasOption("mdns");
-
         try {
             createAndStartServer(webAddress, webPort, localAddress, localPort, secureLocalAddress, secureLocalPort,
-                    modelsFolderPath, redisUrl, publicKey, privateKey, certificate, trustStore, keyStorePath,
-                    keyStoreType, keyStorePass, keyStoreAlias, keyStoreAliasPass, publishDNSSdServices,
-                    cl.hasOption("oc"));
+                    modelsFolderPath, publicKey, privateKey, certificate, trustStore, cl.hasOption("oc"));
         } catch (BindException e) {
             System.err.println(
                     String.format("Web port %s is already used, you could change it using 'webport' option.", webPort));
@@ -376,10 +376,8 @@ public class LeshanServerDemo {
     }
 
     public static void createAndStartServer(String webAddress, int webPort, String localAddress, Integer localPort,
-            String secureLocalAddress, Integer secureLocalPort, String modelsFolderPath, String redisUrl,
-            PublicKey publicKey, PrivateKey privateKey, X509Certificate certificate, List<Certificate> trustStore,
-            String keyStorePath, String keyStoreType, String keyStorePass, String keyStoreAlias,
-            String keyStoreAliasPass, Boolean publishDNSSdServices, boolean supportDeprecatedCiphers) throws Exception {
+                                            String secureLocalAddress, Integer secureLocalPort, String modelsFolderPath,
+                                            PublicKey publicKey, PrivateKey privateKey, X509Certificate certificate, List<Certificate> trustStore, boolean supportDeprecatedCiphers) throws Exception {
         // Prepare LWM2M server
         LeshanServerBuilder builder = new LeshanServerBuilder();
         builder.setEncoder(new DefaultLwM2mNodeEncoder());
@@ -405,13 +403,6 @@ public class LeshanServerDemo {
                 secureLocalPort == null ? coapConfig.getInt(Keys.COAP_SECURE_PORT, LwM2m.DEFAULT_COAP_SECURE_PORT)
                         : secureLocalPort);
 
-        // Connect to redis if needed
-        Pool<Jedis> jedis = null;
-        if (redisUrl != null) {
-            // TODO support sentinel pool and make pool configurable
-            jedis = new JedisPool(new URI(redisUrl));
-        }
-
         // Create DTLS Config
         DtlsConnectorConfig.Builder dtlsConfig = new DtlsConnectorConfig.Builder();
         dtlsConfig.setRecommendedCipherSuitesOnly(!supportDeprecatedCiphers);
@@ -421,61 +412,11 @@ public class LeshanServerDemo {
             // use X.509 mode (+ RPK)
             serverCertificate = certificate;
             builder.setPrivateKey(privateKey);
-            builder.setCertificateChain(new X509Certificate[] { serverCertificate });
+            builder.setCertificateChain(new X509Certificate[]{serverCertificate});
         } else if (publicKey != null) {
             // use RPK only
             builder.setPublicKey(publicKey);
             builder.setPrivateKey(privateKey);
-        } else if (keyStorePath != null) {
-            LOG.warn(
-                    "Keystore way [-ks, -ksp, -kst, -ksa, -ksap] is DEPRECATED for leshan demo and will probably be removed soon, please use [-cert, -prik, -truststore] options");
-
-            // Deprecated way : Set up X.509 mode (+ RPK)
-            try {
-                KeyStore keyStore = KeyStore.getInstance(keyStoreType);
-                try (FileInputStream fis = new FileInputStream(keyStorePath)) {
-                    keyStore.load(fis, keyStorePass == null ? null : keyStorePass.toCharArray());
-                    List<Certificate> trustedCertificates = new ArrayList<>();
-                    for (Enumeration<String> aliases = keyStore.aliases(); aliases.hasMoreElements();) {
-                        String alias = aliases.nextElement();
-                        if (keyStore.isCertificateEntry(alias)) {
-                            trustedCertificates.add(keyStore.getCertificate(alias));
-                        } else if (keyStore.isKeyEntry(alias) && alias.equals(keyStoreAlias)) {
-                            List<X509Certificate> x509CertificateChain = new ArrayList<>();
-                            Certificate[] certificateChain = keyStore.getCertificateChain(alias);
-                            if (certificateChain == null || certificateChain.length == 0) {
-                                LOG.error("Keystore alias must have a non-empty chain of X509Certificates.");
-                                System.exit(-1);
-                            }
-
-                            for (Certificate cert : certificateChain) {
-                                if (!(cert instanceof X509Certificate)) {
-                                    LOG.error("Non-X.509 certificate in alias chain is not supported: {}", cert);
-                                    System.exit(-1);
-                                }
-                                x509CertificateChain.add((X509Certificate) cert);
-                            }
-
-                            Key key = keyStore.getKey(alias,
-                                    keyStoreAliasPass == null ? new char[0] : keyStoreAliasPass.toCharArray());
-                            if (!(key instanceof PrivateKey)) {
-                                LOG.error("Keystore alias must have a PrivateKey entry, was {}",
-                                        key == null ? null : key.getClass().getName());
-                                System.exit(-1);
-                            }
-                            builder.setPrivateKey((PrivateKey) key);
-                            serverCertificate = (X509Certificate) keyStore.getCertificate(alias);
-                            builder.setCertificateChain(
-                                    x509CertificateChain.toArray(new X509Certificate[x509CertificateChain.size()]));
-                        }
-                    }
-                    builder.setTrustedCertificates(
-                            trustedCertificates.toArray(new Certificate[trustedCertificates.size()]));
-                }
-            } catch (KeyStoreException | IOException e) {
-                LOG.error("Unable to initialize X.509.", e);
-                System.exit(-1);
-            }
         }
 
         if (publicKey == null && serverCertificate == null) {
@@ -486,7 +427,7 @@ public class LeshanServerDemo {
                         .readFromResource("credentials/server_privkey.der");
                 serverCertificate = SecurityUtil.certificate.readFromResource("credentials/server_cert.der");
                 builder.setPrivateKey(embeddedPrivateKey);
-                builder.setCertificateChain(new X509Certificate[] { serverCertificate });
+                builder.setCertificateChain(new X509Certificate[]{serverCertificate});
             } catch (Exception e) {
                 LOG.error("Unable to load embedded X.509 certificate.", e);
                 System.exit(-1);
@@ -494,7 +435,7 @@ public class LeshanServerDemo {
         }
 
         // Define trust store
-        if (serverCertificate != null && keyStorePath == null) {
+        if (serverCertificate != null) {
             if (trustStore != null && !trustStore.isEmpty()) {
                 builder.setTrustedCertificates(trustStore.toArray(new Certificate[trustStore.size()]));
             } else {
@@ -507,31 +448,24 @@ public class LeshanServerDemo {
         builder.setDtlsConfig(dtlsConfig);
 
         // Define model provider
-        List<ObjectModel> models = ObjectLoader.loadAllDefault();
-        models.addAll(ObjectLoader.loadDdfResources("/models/", LwM2mDemoConstant.modelPaths));
+        List<ObjectModel> models = ObjectLoader.loadDefault();
+        models.addAll(ObjectLoader.loadDdfResources("/models/", modelPaths));
         if (modelsFolderPath != null) {
-            models.addAll(ObjectLoader.loadObjectsFromDir(new File(modelsFolderPath), true));
+            models.addAll(ObjectLoader.loadObjectsFromDir(new File(modelsFolderPath)));
         }
         LwM2mModelProvider modelProvider = new VersionedModelProvider(models);
         builder.setObjectModelProvider(modelProvider);
 
         // Set securityStore & registrationStore
-        EditableSecurityStore securityStore;
-        if (jedis == null) {
-            // use file persistence
-            securityStore = new FileSecurityStore();
-        } else {
-            // use Redis Store
-            securityStore = new RedisSecurityStore(jedis);
-            builder.setRegistrationStore(new RedisRegistrationStore(jedis));
-        }
+        // use file persistence
+        EditableSecurityStore securityStore = new FileSecurityStore();
         builder.setSecurityStore(securityStore);
 
         // use a magic converter to support bad type send by the UI.
         builder.setEncoder(new DefaultLwM2mNodeEncoder(new MagicLwM2mValueConverter()));
 
         // Create and start LWM2M server
-        LeshanServer lwServer = builder.build();
+        final LeshanServer lwServer = builder.build();
 
         // Now prepare Jetty
         InetSocketAddress jettyAddr;
@@ -567,28 +501,227 @@ public class LeshanServerDemo {
                 new ObjectSpecServlet(lwServer.getModelProvider(), lwServer.getRegistrationService()));
         root.addServlet(objectSpecServletHolder, "/api/objectspecs/*");
 
-        // Register a service to DNS-SD
-        if (publishDNSSdServices) {
-
-            // Create a JmDNS instance
-            JmDNS jmdns = JmDNS.create(InetAddress.getLocalHost());
-
-            // Publish Leshan HTTP Service
-            ServiceInfo httpServiceInfo = ServiceInfo.create("_http._tcp.local.", "leshan", webPort, "");
-            jmdns.registerService(httpServiceInfo);
-
-            // Publish Leshan CoAP Service
-            ServiceInfo coapServiceInfo = ServiceInfo.create("_coap._udp.local.", "leshan", localPort, "");
-            jmdns.registerService(coapServiceInfo);
-
-            // Publish Leshan Secure CoAP Service
-            ServiceInfo coapSecureServiceInfo = ServiceInfo.create("_coaps._udp.local.", "leshan", secureLocalPort, "");
-            jmdns.registerService(coapSecureServiceInfo);
-        }
-
         // Start Jetty & Leshan
         lwServer.start();
         server.start();
+        String v = System.getenv("VERSION");
+        if (v == null) {
+            v = "0.0.0-development";
+        }
+        LOG.info("Version: {}", v);
+
         LOG.info("Web server started at {}.", server.getURI());
+
+        LOG.info("AWS Region: {}", System.getenv("AWS_REGION"));
+        LOG.info("AWS Queue URL: {}", System.getenv("AWS_QUEUE_URL"));
+
+        // Listen for Device Shadow Deltas
+        String iotEndpoint = System.getenv("AWS_IOT_ENDPOINT");
+        LOG.info("AWS IoT endpoint: {}", iotEndpoint);
+        final String clientId = "leshan-" + UUID.randomUUID().toString();
+        GetSessionTokenRequest request = new GetSessionTokenRequest();
+        GetSessionTokenResult sessionTokenResult = sts.getSessionToken(request);
+        Credentials creds = sessionTokenResult.getCredentials();
+        final AWSIotMqttClient awsIotMqttClient = new AWSIotMqttClient(iotEndpoint, clientId, creds.getAccessKeyId(), creds.getSecretAccessKey(), creds.getSessionToken());
+        awsIotMqttClient.connect();
+        final Map<String, IotDeltaTopic> iotDevices = Collections.synchronizedMap(new HashMap<String, IotDeltaTopic>());
+
+        lwServer.getRegistrationService().addListener(new RegistrationListener() {
+            @Override
+            public void registered(final Registration registration, Registration previousReg,
+                                   Collection<Observation> previousObservations) {
+                LOG.info("new device: {}", registration.getEndpoint());
+
+                ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
+                executorService.schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        ArrayList<int[]> paths = new ArrayList<int[]>();
+                        paths.add(new int[]{3, 0, 9}); // Observe battery
+                        paths.add(new int[]{4, 0, 2}); // Observe radio signal strength
+                        paths.add(new int[]{3303, 0, 5700}); // Observe temperature
+                        paths.add(new int[]{3347, 0, 5501}); // Observe button 1 counter
+                        paths.add(new int[]{3347, 1, 5501}); // Observe button 2 counter
+                        observe(lwServer, registration, paths);
+                    }
+                }, 5, TimeUnit.SECONDS);
+
+                try {
+                    LOG.info("Iot: subscribing {}", registration.getEndpoint());
+                    IotDeltaTopic d = new IotDeltaTopic(registration.getEndpoint(), new OnDelta() {
+                        @Override
+                        public void onResourceDelta(final Number objectId, final Number objectInstanceId, final Number resourceId, final Boolean value) {
+                            LOG.info("Delta /{}/{}/{}: {}", objectId, objectInstanceId, resourceId, value);
+
+                            JSONObject resources = new JSONObject();
+                            resources.put(resourceId.toString(), value);
+
+                            JSONObject instances = new JSONObject();
+                            instances.put(objectInstanceId.toString(), resources);
+
+                            JSONObject reported = new JSONObject();
+                            reported.put(objectId.toString(), instances);
+
+                            JSONObject state = new JSONObject();
+                            state.put("reported", reported);
+
+                            JSONObject update = new JSONObject();
+                            update.put("state", state);
+
+                            try {
+                                awsIotMqttClient.publish(
+                                        new IotUpdateState(
+                                                "$aws/things/?/shadow/update".replace("?", registration.getEndpoint()),
+                                                AWSIotQos.QOS0,
+                                                update.toString()
+                                        ),
+                                        3000
+                                );
+                            } catch (AWSIotException err) {
+                                LOG.error("Could not update reported state {}: {}", registration.getEndpoint(), err.getMessage());
+                            }
+
+                            LOG.info("Updating resource: /{}/{}/{} on {} to {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), value);
+
+                            lwServer.send(
+                                    registration,
+                                    new WriteRequest(objectId.intValue(), objectInstanceId.intValue(), resourceId.intValue(), value),
+                                    new ResponseCallback<WriteResponse>() {
+                                        @Override
+                                        public void onResponse(WriteResponse response) {
+                                            LOG.info("Updated resource: /{}/{}/{} on {} to {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), value);
+                                        }
+                                    },
+                                    new ErrorCallback() {
+                                        @Override
+                                        public void onError(Exception e) {
+                                            LOG.error("Failed to update resource: /{}/{}/{} on {} to {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), value);
+                                        }
+                                    }
+                            );
+                        }
+                    });
+                    iotDevices.put(registration.getEndpoint(), d);
+                    awsIotMqttClient.subscribe(d);
+                } catch (AWSIotException err) {
+                    LOG.error("Could not subscribe {}: {}", registration.getEndpoint(), err.getMessage());
+                }
+            }
+
+            @Override
+            public void updated(RegistrationUpdate update, Registration updatedReg, Registration previousReg) {
+                LOG.info("device is still here: {}", updatedReg.getEndpoint());
+            }
+
+            @Override
+            public void unregistered(Registration registration, Collection<Observation> observations, boolean expired,
+                                     Registration newReg) {
+                LOG.info("device left: {}", registration.getEndpoint());
+                try {
+                    if (iotDevices.containsKey(registration.getEndpoint())) {
+                        LOG.info("Iot: unsubscribing {}", registration.getEndpoint());
+                        awsIotMqttClient.unsubscribe(
+                                iotDevices.get(registration.getEndpoint())
+                        );
+                    }
+                } catch (AWSIotException err) {
+                    LOG.error("Could not unsubscribe {}: {}", registration.getEndpoint(), err.getMessage());
+                }
+            }
+        });
+
+        lwServer.getObservationService().addListener(new ObservationListener() {
+            @Override
+            public void newObservation(Observation observation, Registration registration) {
+                LOG.info("new obervation ({}): {} on {}", observation.getRegistrationId(), observation.getPath().toString(), registration.getEndpoint());
+            }
+
+            @Override
+            public void cancelled(Observation observation) {
+                LOG.info("observation cancelled: {}", observation.getRegistrationId());
+            }
+
+            @Override
+            public void onResponse(Observation observation, Registration registration, ObserveResponse response) {
+                LOG.info("observation response: {} on {}: {}", response.getObservation().getPath().toString(), registration.getEndpoint(), ((LwM2mSingleResource) response.getContent()).getValue().toString());
+                publishObservationResponse(registration, response);
+            }
+
+            @Override
+            public void onError(Observation observation, Registration registration, Exception error) {
+                LOG.info("observation {} error:", observation.getRegistrationId());
+                LOG.info(error.toString());
+            }
+        });
+    }
+
+    private static void observe(final LeshanServer lwServer, final Registration registration, final ArrayList<int[]> paths) {
+        if (paths.size() == 0) return;
+        int[] el = paths.remove(0);
+        final int objectId = el[0];
+        final int objectInstanceId = el[1];
+        final int resourceId = el[2];
+        LOG.info("Trying to observe /{}/{}/{} on {}", objectId, objectInstanceId, resourceId, registration.getEndpoint());
+        lwServer.send(
+                registration,
+                new ObserveRequest(objectId, objectInstanceId, resourceId),
+                TIMEOUT_IN_MS,
+                new ResponseCallback<ObserveResponse>() {
+                    @Override
+                    public void onResponse(ObserveResponse response) {
+                        if (response.isSuccess()) {
+                            LOG.info("Observing /{}/{}/{} on {}: {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), ((LwM2mSingleResource) response.getContent()).getValue().toString());
+                            publishNotification(registration, objectId, objectInstanceId, resourceId, ((LwM2mResource) response.getContent()).getValue().toString());
+                        } else {
+                            LOG.error("Failed to observe /{}/{}/{} on {}: {} {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), response.getCode(), response.getErrorMessage());
+                        }
+                        observe(lwServer, registration, paths);
+                    }
+                }, new ErrorCallback() {
+                    @Override
+                    public void onError(Exception e) {
+                        LOG.error("Failed to observe /{}/{}/{} on {}: {}", objectId, objectInstanceId, resourceId, registration.getEndpoint(), e.getMessage());
+                        observe(lwServer, registration, paths);
+                    }
+                }
+        );
+    }
+
+    private static void publishObservationResponse(Registration registration, ObserveResponse response) {
+        LwM2mPath path = response.getObservation().getPath();
+        publishNotification(registration, path.getObjectId(), path.getObjectInstanceId(), path.getResourceId(), ((LwM2mSingleResource) response.getContent()).getValue().toString());
+    }
+
+    private static void publishNotification(Registration registration, int objectId, int objectInstanceId, int resourceId, String value) {
+        final Map<String, MessageAttributeValue> messageAttributes = new HashMap<>();
+        // Endpoint
+        messageAttributes.put("Endpoint", new MessageAttributeValue()
+                .withDataType("String")
+                .withStringValue(registration.getEndpoint()));
+
+        // Path
+        messageAttributes.put("objectId", new MessageAttributeValue()
+                .withDataType("String")
+                .withStringValue(String.valueOf(objectId)));
+        messageAttributes.put("objectInstanceId", new MessageAttributeValue()
+                .withDataType("String")
+                .withStringValue(String.valueOf(objectInstanceId)));
+        messageAttributes.put("resourceId", new MessageAttributeValue()
+                .withDataType("String")
+                .withStringValue(String.valueOf(resourceId)));
+
+        // Value
+        messageAttributes.put("Value", new MessageAttributeValue()
+                .withDataType("String")
+                .withStringValue(value));
+
+        SendMessageRequest send_msg_request = new SendMessageRequest()
+                .withQueueUrl(System.getenv("AWS_QUEUE_URL"))
+                .withMessageAttributes(messageAttributes)
+                .withMessageGroupId(registration.getEndpoint())
+                .withMessageDeduplicationId(UUID.randomUUID().toString())
+                .withMessageBody(String.format("%s\t/%d/%d/%d\t%s", registration.getEndpoint(), objectId, objectInstanceId, resourceId, value));
+
+        sqs.sendMessage(send_msg_request);
     }
 }
